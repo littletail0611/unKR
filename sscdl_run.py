@@ -128,7 +128,8 @@ def main():
         if not args.test_only:
             # train&valid
             trainer.fit(lit_model, datamodule=kgdata)
-            path = model_checkpoint_last.best_model_path
+            path = model_checkpoint3.best_model_path # NL27k
+            # path = model_checkpoint1.best_model_path # CN15k
         else:
             path = ""
 
