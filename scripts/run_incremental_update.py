@@ -28,6 +28,7 @@
 """
 
 import argparse
+import math
 import os
 import sys
 
@@ -36,6 +37,57 @@ import torch
 # 确保 src 目录在 PYTHONPATH 中（适配直接运行脚本的场景）
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "src"))
+
+
+class Logger:
+    """评估指标日志打印器，输出格式与 update 仓库 Logger.print_metrics() 对齐。"""
+
+    @staticmethod
+    def print_metrics(title: str, mse: float, mae: float, rmse: float):
+        print(f"\n[{title}]")
+        print(f"  - MSE:  {mse:.4f}")
+        print(f"  - MAE:  {mae:.4f}")
+        print(f"  - RMSE: {rmse:.4f}")
+        print("-" * 30)
+
+
+def evaluate_model(adapter, facts, device):
+    """评估模型在给定事实集上的 MSE / MAE / RMSE。
+
+    只评估有标注的事实（``fact[3] is not None``）。
+    使用 ``adapter.entity_emb.weight`` 作为实体表征 z，
+    通过 ``adapter.predict(z[h], r, z[t])`` 获取预测置信度。
+
+    Args:
+        adapter: :class:`UnKRModelAdapter` 实例。
+        facts:   事实列表，每条为 ``(h, r, t, conf_or_None)``。
+        device:  运算设备字符串（如 ``"cpu"`` 或 ``"cuda:0"``）。
+
+    Returns:
+        ``(mse, mae, rmse)`` 三元组；若无有效标注事实则返回
+        ``(None, None, None)``。
+    """
+    labeled = [f for f in facts if f[3] is not None]
+    if not labeled:
+        return None, None, None
+
+    h_ids = torch.tensor([f[0] for f in labeled], dtype=torch.long, device=device)
+    r_ids = torch.tensor([f[1] for f in labeled], dtype=torch.long, device=device)
+    t_ids = torch.tensor([f[2] for f in labeled], dtype=torch.long, device=device)
+    labels = torch.tensor([float(f[3]) for f in labeled], dtype=torch.float, device=device)
+
+    adapter.eval()
+    with torch.no_grad():
+        z = adapter.entity_emb.weight
+        preds, _ = adapter.predict(z[h_ids], r_ids, z[t_ids])
+
+    preds = preds.detach().cpu()
+    labels = labels.cpu()
+
+    mse = torch.mean((preds - labels) ** 2).item()
+    mae = torch.mean(torch.abs(preds - labels)).item()
+    rmse = math.sqrt(mse)
+    return mse, mae, rmse
 
 
 def get_args():
@@ -378,6 +430,44 @@ def run(args):
     save_path = os.path.join(out_dir, f"final_belief_state_{dataset_name}.pt")
     torch.save(dataset.belief_state, save_path)
     print(f">>> 全局 Belief 状态已保存至 {save_path}")
+
+    # ------------------------------------------------------------------
+    # 6. 增量更新后模型评估
+    # ------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("增量更新后模型评估")
+    print(f"{'='*60}")
+
+    # Inc Test 评估
+    inc_mse, inc_mae, inc_rmse = evaluate_model(adapter, dataset.inc_test, args.device)
+    if inc_mse is not None:
+        Logger.print_metrics(
+            "Post-update Model on Inc Test Evaluation",
+            inc_mse, inc_mae, inc_rmse,
+        )
+    else:
+        print("\n[Post-update Model on Inc Test Evaluation]: 无有标注事实，跳过。")
+
+    # Base Test 评估
+    base_mse, base_mae, base_rmse = evaluate_model(adapter, dataset.base_test, args.device)
+    if base_mse is not None:
+        Logger.print_metrics(
+            "Post-update Model on Base Test Evaluation",
+            base_mse, base_mae, base_rmse,
+        )
+    else:
+        print("\n[Post-update Model on Base Test Evaluation]: 无有标注事实，跳过。")
+
+    # Combined Test 评估（Base + Inc 的并集）
+    combined_facts = dataset.base_test + dataset.inc_test
+    comb_mse, comb_mae, comb_rmse = evaluate_model(adapter, combined_facts, args.device)
+    if comb_mse is not None:
+        Logger.print_metrics(
+            "Post-update Model on Combined Test Evaluation",
+            comb_mse, comb_mae, comb_rmse,
+        )
+    else:
+        print("\n[Post-update Model on Combined Test Evaluation]: 无有标注事实，跳过。")
 
 
 if __name__ == "__main__":
