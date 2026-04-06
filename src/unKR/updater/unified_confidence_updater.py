@@ -10,6 +10,9 @@ import torch
 import torch.optim as optim
 import torch.nn.functional as F
 
+# 纯嵌入模型替代 ITE 策略中，用于区分"有效预测差分"与"接近零"的最小阈值
+_PREDICT_DIFF_THRESHOLD = 1e-6
+
 class UnifiedConfidenceUpdater:
     """
     动态更新知识图谱中事实的置信度得分。
@@ -413,8 +416,123 @@ class UnifiedConfidenceUpdater:
 
         return edge_mask
 
+    def _is_pure_embedding_model(self):
+        """检测模型是否为纯嵌入模型（如 UnKRModelAdapter 包装的 unKR 模型）。
+
+        纯嵌入模型的 forward() 不感知图结构变化（直接返回 entity_emb.weight），
+        因此需要使用替代 ITE 策略。判断依据：模型拥有 ``unkr_model`` 属性。
+        """
+        return hasattr(self.model, 'unkr_model')
+
+    def _compute_causal_influence_embedding_fallback(
+        self, base_edge_idx, base_edge_type, base_edge_conf,
+        mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq, has_label_mask=None
+    ):
+        """纯嵌入模型的替代因果影响计算策略。
+
+        由于纯嵌入模型的 ``forward()`` 不感知图结构，加入新边前后 ``forward()``
+        输出不变，导致原始 ITE = 0。本方法通过以下两种机制替代：
+
+        1. **预测差分 ITE**：使用阶段 1 微调后的当前嵌入重新计算旧事实预测值，
+           与微调前的 ``mu_without`` 做差。对于端点含新实体的旧边，新实体嵌入
+           在阶段 1 已更新，因此预测差分非零。
+
+        2. **拓扑距离兜底 ITE**：对于两个端点都是旧实体的边（预测差分 ≈ 0），
+           根据与新实体的 K-hop 拓扑距离赋予衰减的非零 ITE（``gamma^hop``），
+           确保下游贝叶斯滤波与局部精炼不被短路。
+
+        Args:
+            base_edge_idx:   基础图边索引 [2, E]。
+            base_edge_type:  基础图关系 ID [E]。
+            base_edge_conf:  基础图置信度 [E]。
+            mu_without:      阶段 1 微调前对旧事实的预测值 [E]。
+            h_idx, r_idx, t_idx: 新事实的头/关系/尾 ID。
+            new_mu:          新事实的预测置信度。
+            new_sigma_sq:    新事实的预测方差。
+            has_label_mask:  新事实中有标注的掩码。
+
+        Returns:
+            (S_tau_global, mu_with_global, sigma_sq_old_global)
+        """
+        new_ents = torch.cat([h_idx, t_idx]).unique()
+        num_hops = getattr(self.args, 'causal_num_hops', 2) if self.args else 2
+
+        E_total = base_edge_idx.shape[1]
+        S_tau_global = torch.zeros(E_total, dtype=torch.float, device=self.device)
+        mu_with_global = mu_without.clone()
+        sigma_sq_old_global = torch.zeros(E_total, dtype=torch.float, device=self.device)
+
+        # BFS 逐跳扩展，记录每条边到新实体集合的最小 hop 距离
+        visited_nodes = new_ents.clone()
+        assigned_mask = torch.zeros(E_total, dtype=torch.bool, device=self.device)
+        hop_distance = torch.zeros(E_total, dtype=torch.float, device=self.device)
+
+        for hop in range(1, num_hops + 1):
+            mask_h = torch.isin(base_edge_idx[0], visited_nodes)
+            mask_t = torch.isin(base_edge_idx[1], visited_nodes)
+            hop_edge_mask = (mask_h | mask_t) & ~assigned_mask
+
+            if not hop_edge_mask.any():
+                break
+
+            assigned_mask |= hop_edge_mask
+            hop_distance[hop_edge_mask] = float(hop)
+            visited_nodes = torch.unique(base_edge_idx[:, assigned_mask])
+
+        sub_mask = assigned_mask
+        if not sub_mask.any():
+            return S_tau_global, mu_with_global, sigma_sq_old_global
+
+        sub_base_edge_idx = base_edge_idx[:, sub_mask]
+        sub_base_edge_type = base_edge_type[sub_mask]
+        sub_mu_without = mu_without[sub_mask]
+
+        # 使用阶段 1 微调后的当前嵌入重新计算旧事实预测置信度
+        with torch.no_grad():
+            curr_z = self.model.entity_emb.weight
+            sub_mu_with, sub_sigma_sq_old = self.model.predict(
+                curr_z[sub_base_edge_idx[0]], sub_base_edge_type, curr_z[sub_base_edge_idx[1]]
+            )
+
+        # 预测差分 ITE：对含新实体端点的边有效
+        predict_diff = torch.abs(sub_mu_with - sub_mu_without)
+
+        # 拓扑距离兜底 ITE：hop 越小衰减越少（1-hop: gamma, 2-hop: gamma^2, ...）
+        sub_hop_dist = hop_distance[sub_mask]
+        topology_ite = self.gamma ** sub_hop_dist
+
+        # 优先使用预测差分；若差分接近 0（纯旧实体边），退回拓扑兜底
+        ITE_sub = torch.where(predict_diff > _PREDICT_DIFF_THRESHOLD, predict_diff, topology_ite)
+
+        per_fact_sigma = new_sigma_sq.clone()
+        if has_label_mask is not None and has_label_mask.any():
+            per_fact_sigma[has_label_mask] = 0.0
+        intervention_reliability = 1.0 / (1.0 + per_fact_sigma.mean().item())
+
+        t_nodes_sub = sub_base_edge_idx[1]
+        node_degrees = torch.bincount(t_nodes_sub, minlength=self.dataset.base_num_ent)
+        target_degrees = node_degrees[t_nodes_sub].float()
+        confounder_penalty = 1.0 / torch.log2(target_degrees + 2.0)
+
+        S_tau_sub = ITE_sub * intervention_reliability * confounder_penalty * self.gamma
+        S_tau_sub = torch.where(S_tau_sub < 1e-4, torch.zeros_like(S_tau_sub), S_tau_sub)
+
+        S_tau_global[sub_mask] = S_tau_sub
+        mu_with_global[sub_mask] = sub_mu_with
+        sigma_sq_old_global[sub_mask] = sub_sigma_sq_old
+
+        return S_tau_global, mu_with_global, sigma_sq_old_global
+
     def _compute_causal_influence(self, base_edge_idx, base_edge_type, base_edge_conf, mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq, has_label_mask=None):
         self.model.eval()
+
+        # 纯嵌入模型（如 UnKRModelAdapter）的 forward() 不感知图结构变化，
+        # 使用替代的拓扑距离 + 预测差分 ITE 策略
+        if self._is_pure_embedding_model():
+            return self._compute_causal_influence_embedding_fallback(
+                base_edge_idx, base_edge_type, base_edge_conf,
+                mu_without, h_idx, r_idx, t_idx, new_mu, new_sigma_sq, has_label_mask
+            )
 
         new_ents = torch.cat([h_idx, t_idx]).unique()
         num_hops = getattr(self.args, 'causal_num_hops', 2) if self.args else 2
