@@ -165,6 +165,36 @@ def build_model(model_name: str, num_ent: int, num_rel: int, args):
     return model_cls(model_args)
 
 
+def expand_embedding(ckpt_tensor: torch.Tensor, model_tensor: torch.Tensor,
+                     device: str) -> torch.Tensor:
+    """将 checkpoint 嵌入矩阵扩展到与模型当前嵌入矩阵相同的行数。
+
+    当预训练 checkpoint 仅含 base_num_ent 个实体（或 base_num_rel 个关系），而当前
+    模型已含增量新实体/关系时，需要将 checkpoint 矩阵从 [N_base, D] 扩展到
+    [N_model, D]。新增行使用 checkpoint 矩阵各行的均值初始化。
+
+    Args:
+        ckpt_tensor:  来自 checkpoint 的权重张量，形状 [N_base, D]。
+        model_tensor: 当前模型的权重张量，形状 [N_model, D]（N_model > N_base）。
+        device:       目标设备。
+
+    Returns:
+        expanded: 形状 [N_model, D] 的扩展张量，前 N_base 行来自 checkpoint，
+                  其余行使用均值初始化。
+    """
+    n_base = ckpt_tensor.shape[0]
+    n_model = model_tensor.shape[0]
+    n_new = n_model - n_base
+
+    ckpt_data = ckpt_tensor.to(device)
+    mean_row = ckpt_data.mean(dim=0)
+
+    expanded = model_tensor.data.clone()
+    expanded[:n_base] = ckpt_data
+    expanded[n_base:] = mean_row.unsqueeze(0).expand(n_new, -1)
+    return expanded
+
+
 def load_checkpoint(model, ckpt_path: str, device: str):
     """加载预训练权重（支持 PyTorch Lightning .ckpt 和普通 .pth 格式）。
 
@@ -172,8 +202,13 @@ def load_checkpoint(model, ckpt_path: str, device: str):
     1. Lightning checkpoint 格式：权重存储在 ``state_dict`` 键下，且键名可能携带
        ``"model."`` 或 ``"lit_model.model."`` 前缀，本函数统一去除。
     2. 嵌入尺寸不匹配：预训练模型仅含 base_num_ent 个实体的嵌入，而当前模型（已含
-       增量新实体）的嵌入表行数更多。对于尺寸不匹配的矩阵参数，将 checkpoint 的基础
-       行复制到模型对应位置，新增行则用基础行均值初始化。
+       增量新实体）的嵌入表行数更多。在调用 load_state_dict 之前先扩展 checkpoint
+       中尺寸不足的矩阵参数（新增行用均值初始化），确保不触发 RuntimeError。
+
+    Note:
+        ``torch.nn.Module.load_state_dict(strict=False)`` 仅允许多余/缺失键，
+        但对于形状不匹配的参数仍会抛出 RuntimeError。因此必须在调用
+        load_state_dict 之前完成嵌入扩展。
     """
     print(f">>> 加载预训练权重: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location=device)
@@ -191,34 +226,37 @@ def load_checkpoint(model, ckpt_path: str, device: str):
             else:
                 state_dict[k] = v
 
-    # 先用 strict=False 加载，处理多余/缺失键
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-
-    # 处理矩阵参数尺寸不匹配：将 checkpoint 基础行复制到模型中，新行用均值初始化
+    # 在调用 load_state_dict 之前处理矩阵参数尺寸不匹配。
+    # 注意：strict=False 只允许多余/缺失键，对 shape 不匹配仍会抛 RuntimeError，
+    # 因此必须在此处提前调整 checkpoint 张量尺寸，而非在 load_state_dict 之后。
     all_model_tensors = {**dict(model.named_parameters()), **dict(model.named_buffers())}
+    adjusted_state_dict = {}
     for key, ckpt_tensor in state_dict.items():
         if key not in all_model_tensors:
+            adjusted_state_dict[key] = ckpt_tensor
             continue
+
         model_tensor = all_model_tensors[key]
         if model_tensor.shape == ckpt_tensor.shape:
-            continue  # 尺寸匹配，已在 load_state_dict 中正确加载
-        if model_tensor.dim() < 2 or model_tensor.shape[0] <= ckpt_tensor.shape[0]:
-            continue  # 非矩阵参数，或模型比 checkpoint 小（不支持缩减）
+            adjusted_state_dict[key] = ckpt_tensor
+            continue
 
-        # 模型的行数多于 checkpoint（预训练仅含 base 实体）
-        n_base = ckpt_tensor.shape[0]
-        n_model = model_tensor.shape[0]
-        ckpt_data = ckpt_tensor.to(device)
-        mean_row = ckpt_data.mean(dim=0)
-        n_new = n_model - n_base
+        if (model_tensor.dim() >= 2
+                and model_tensor.shape[0] > ckpt_tensor.shape[0]
+                and model_tensor.shape[1:] == ckpt_tensor.shape[1:]):
+            # 模型的行数多于 checkpoint（e.g. base checkpoint 行数 < 增量后实体总数）
+            n_base = ckpt_tensor.shape[0]
+            n_new = model_tensor.shape[0] - n_base
+            adjusted_state_dict[key] = expand_embedding(ckpt_tensor, model_tensor, device)
+            print(
+                f"  嵌入扩展: {key} {list(ckpt_tensor.shape)} → {list(model_tensor.shape)}"
+                f"（新增 {n_new} 行使用均值初始化）"
+            )
+        else:
+            # 其他尺寸不匹配情况：保留 checkpoint 原始张量，交由 load_state_dict 报告
+            adjusted_state_dict[key] = ckpt_tensor
 
-        with torch.no_grad():
-            model_tensor.data[:n_base] = ckpt_data
-            model_tensor.data[n_base:] = mean_row.unsqueeze(0).expand(n_new, -1)
-        print(
-            f"  嵌入扩展: {key} {list(ckpt_tensor.shape)} → {list(model_tensor.shape)}"
-            f"（新增 {n_new} 行使用均值初始化）"
-        )
+    missing, unexpected = model.load_state_dict(adjusted_state_dict, strict=False)
 
     if missing:
         print(f"  警告: 缺失键（参数保留为模型初始化值）: {missing[:5]}"
